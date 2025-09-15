@@ -22,9 +22,6 @@
 namespace holoscan {
 namespace ops {
 
-void LoadOperator::setup(OperatorSpec& spec) {
-  spec.output<std::map<std::string, int>>("load_data");
-}
 
 void LoadOperator::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
   // Perform CPU-intensive work
@@ -38,7 +35,7 @@ void LoadOperator::compute(InputContext& op_input, OutputContext& op_output, Exe
 void LoadOperator::consume_cpu() {
   // Convert milliseconds to seconds
   double work_duration = load_duration_ms_ / 1000.0;
-  auto end_time = std::chrono::steady_clock::now() + 
+  auto end_time = std::chrono::steady_clock::now() +
                   std::chrono::duration<double>(work_duration);
 
   // Busy loop to consume CPU

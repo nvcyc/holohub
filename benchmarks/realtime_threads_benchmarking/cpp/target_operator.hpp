@@ -33,7 +33,6 @@ class TargetOperator : public Operator {
 
   TargetOperator(int target_fps = 60) : target_fps_(target_fps), target_period_ns_(static_cast<int64_t>(1e9 / target_fps)) {}
 
-  void setup(OperatorSpec& spec) override;
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
 
   // Get comprehensive performance statistics and raw data

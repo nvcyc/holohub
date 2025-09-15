@@ -24,342 +24,373 @@
 
 #include <holoscan/holoscan.hpp>
 
-#include "target_operator.hpp"
-#include "load_operator.hpp"
-#include "data_sink_operator.hpp"
-
 using namespace holoscan;
 
-class RealtimeThreadBenchmark : public Application {
+struct BenchmarkStats {
+  double avg = 0.0;
+  double std_dev = 0.0;
+  double min_val = 0.0;
+  double p50 = 0.0;
+  double p95 = 0.0;
+  double p99 = 0.0;
+  double max_val = 0.0;
+  size_t sample_count = 0;
+  std::vector<double> sorted_data;
+};
+
+// Calculate percentiles from sorted data
+double calculate_percentile(const std::vector<double>& sorted_data, double percentile) {
+  if (sorted_data.empty())
+    return 0.0;
+
+  double index = (percentile / 100.0) * (sorted_data.size() - 1);
+  size_t lower = static_cast<size_t>(std::floor(index));
+  size_t upper = static_cast<size_t>(std::ceil(index));
+
+  if (lower == upper) {
+    return sorted_data[lower];
+  }
+
+  double weight = index - lower;
+  return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight;
+}
+
+// Calculate standard deviation
+double calculate_std_dev(const std::vector<double>& data, double mean) {
+  if (data.size() <= 1)
+    return 0.0;
+
+  double sum_sq_diff = 0.0;
+  for (double value : data) {
+    double diff = value - mean;
+    sum_sq_diff += diff * diff;
+  }
+
+  return std::sqrt(sum_sq_diff / (data.size() - 1));
+}
+
+// Calculate benchmark statistics
+BenchmarkStats calculate_benchmark_stats(
+  const std::vector<double>& raw_values, bool skip_negative_values = false) {
+  BenchmarkStats stats;
+
+  // Extract values
+  for (const auto& value : raw_values) {
+    if (value >= 0.0 || !skip_negative_values) {
+      stats.sorted_data.push_back(value);
+    }
+  }
+
+  if (stats.sorted_data.empty())
+    return stats;
+
+  std::sort(stats.sorted_data.begin(), stats.sorted_data.end());
+  stats.sample_count = stats.sorted_data.size();
+
+  // Calculate basic statistics
+  stats.avg =
+      std::accumulate(stats.sorted_data.begin(), stats.sorted_data.end(), 0.0) / stats.sample_count;
+  stats.std_dev = calculate_std_dev(stats.sorted_data, stats.avg);
+
+  // Calculate percentiles
+  stats.min_val = stats.sorted_data.front();
+  stats.max_val = stats.sorted_data.back();
+  stats.p50 = calculate_percentile(stats.sorted_data, 50.0);
+  stats.p95 = calculate_percentile(stats.sorted_data, 95.0);
+  stats.p99 = calculate_percentile(stats.sorted_data, 99.0);
+
+  return stats;
+}
+
+// Calculate empirical CDF at a given value
+double calculate_cdf(const std::vector<double>& data, double x) {
+  if (data.empty())
+    return 0.0;
+
+  int count = 0;
+  for (double value : data) {
+    if (value <= x)
+      count++;
+  }
+
+  return static_cast<double>(count) / data.size();
+}
+
+void run_dummy_cpu_workload(int workload_size = 100, int load_intensity = 100) {
+  std::vector<double> data(workload_size);
+  double work_result = 0.0;
+  for (int i = 0; i < load_intensity; ++i) {
+    for (size_t i = 0; i < data.size(); ++i) {
+      data[i] = std::sin(i * 0.01) * std::cos(i * 0.02);
+    }
+    for (double x : data) {
+      work_result += std::sqrt(std::abs(x) + 1.0);
+    }
+  }
+}
+
+class DummyLoadOp : public Operator {
  public:
-  RealtimeThreadBenchmark(int target_fps = 60,
-                         int duration_seconds = 30,
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(DummyLoadOp)
+
+  DummyLoadOp(int workload_size = 1000)
+  : workload_size_(workload_size) {}
+
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
+    run_dummy_cpu_workload(workload_size_);
+  };
+
+ private:
+   int workload_size_;
+ };
+
+class BenchmarkOp : public Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(BenchmarkOp)
+
+  BenchmarkOp(int target_fps = 60,
+              int load_intensity = 100,
+              int workload_size = 100)
+            : target_fps_(target_fps),
+              target_period_ns_(static_cast<int64_t>(1e9 / target_fps)),
+              load_intensity_(load_intensity),
+              workload_size_(workload_size) {}
+
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
+    auto start_time = std::chrono::steady_clock::now();
+
+    if (last_start_time_ == std::chrono::steady_clock::time_point()) {
+      last_start_time_ = start_time;
+    } else {
+      auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        start_time - last_start_time_).count();
+      periods_ns_.push_back(period_ns);
+      last_start_time_ = start_time;
+    }
+
+    run_dummy_cpu_workload(workload_size_, load_intensity_);
+    auto end_time = std::chrono::steady_clock::now();
+
+    auto execution_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end_time - start_time).count();
+    execution_times_ns_.push_back(execution_time_ns);
+
+    HOLOSCAN_LOG_INFO("[BenchmarkOp] ticking.");
+
+  };
+
+  BenchmarkStats get_execution_time_benchmark_stats() const {
+    BenchmarkStats benchmark_stats;
+
+    if (execution_times_ns_.empty()) {
+      return benchmark_stats;
+    }
+
+    // Convert nanoseconds to milliseconds for statistics
+    std::vector<double> execution_times_ms;
+    for (double ns : execution_times_ns_) {
+      execution_times_ms.push_back(ns / 1e6);
+    }
+
+    benchmark_stats = calculate_benchmark_stats(execution_times_ms, false);
+
+    return benchmark_stats;
+  }
+
+  BenchmarkStats get_period_benchmark_stats() const {
+    BenchmarkStats benchmark_stats;
+    if (periods_ns_.empty()) {
+      return benchmark_stats;
+    }
+    
+    // Convert nanoseconds to milliseconds for statistics
+    std::vector<double> periods_ms;
+    for (double ns : periods_ns_) {
+      periods_ms.push_back(ns / 1e6);
+    }
+
+    benchmark_stats = calculate_benchmark_stats(periods_ms, false);
+    return benchmark_stats;
+  }
+
+private:
+  int target_fps_;
+  int64_t target_period_ns_;
+  int load_intensity_;
+  int workload_size_;
+  std::vector<double> periods_ns_;
+  std::vector<double> execution_times_ns_;
+  std::chrono::steady_clock::time_point last_start_time_{};
+  mutable std::mutex lock_;
+  double work_result_;
+};
+
+class RealtimeThreadBenchmarkApp : public Application {
+ public:
+  RealtimeThreadBenchmarkApp(int target_fps = 60,
                          bool use_realtime = false,
                          SchedulingPolicy scheduling_policy = SchedulingPolicy::kDeadline,
-                         double load_duration_ms = 10.0)
+                         int background_load_intensity = 1000,
+                         int background_workload_size = 1000)
       : target_fps_(target_fps),
-        duration_seconds_(duration_seconds),
         use_realtime_(use_realtime),
         scheduling_policy_(scheduling_policy),
-        load_duration_ms_(load_duration_ms) {}
+        background_load_intensity_(background_load_intensity),
+        background_workload_size_(background_workload_size) {}
 
   void compose() override {
-    // Create operators
-    auto target_op = make_operator<ops::TargetOperator>("target_op", target_fps_);
-    auto load_op1 = make_operator<ops::LoadOperator>("load_op1", load_duration_ms_);
-    auto load_op2 = make_operator<ops::LoadOperator>("load_op2", load_duration_ms_);
-    auto sink_op = make_operator<ops::DataSinkOperator>("sink_op");
+    benchmark_op_ = make_operator<BenchmarkOp>("benchmark_op", target_fps_);
+    add_operator(benchmark_op_);
 
-    // Store reference to target operator for statistics
-    target_operator_ = target_op;
+    auto periodic_condition = make_condition<PeriodicCondition>("periodic_condition", 1000000000 / target_fps_);
 
-    // Create thread pools with limited worker threads to create contention
     if (use_realtime_) {
-      // Realtime pool for target operator
-      auto realtime_pool = make_thread_pool("realtime_pool", 1);
+      // Create a thread pool for hosting the real-time thread
+      auto realtime_pool = make_thread_pool("realtime_thread_pool");
 
       if (scheduling_policy_ == SchedulingPolicy::kDeadline) {
         int64_t period_ns = static_cast<int64_t>(1e9 / target_fps_);
-        int64_t deadline_ns = static_cast<int64_t>(period_ns * 0.95);  // 95% of period
-        int64_t runtime_ns = static_cast<int64_t>(period_ns * 0.10);   // 10% of period
+        int64_t deadline_ns = period_ns;
+        int64_t runtime_ns = static_cast<int64_t>(period_ns * 0.10);  // 10% of period
 
-        realtime_pool->add_realtime(target_op, scheduling_policy_, true, {0},
+        realtime_pool->add_realtime(benchmark_op_, scheduling_policy_, true, {0}, 0,
                                    runtime_ns, deadline_ns, period_ns);
       } else if (scheduling_policy_ == SchedulingPolicy::kFirstInFirstOut ||
                  scheduling_policy_ == SchedulingPolicy::kRoundRobin) {
-        realtime_pool->add_realtime(target_op, scheduling_policy_, true, {0}, 99);
+        realtime_pool->add_realtime(benchmark_op_, scheduling_policy_, true, {0}, 99);
+        benchmark_op_->add_arg(periodic_condition);
       }
-
-      // Regular pool for load operators (competing for resources)
-      auto load_pool = make_thread_pool("load_pool", 1);
-      load_pool->add(load_op1, true, {1});
-      load_pool->add(load_op2, true, {1});
     } else {
-      // All operators share the same pool (no realtime scheduling)
-      auto shared_pool = make_thread_pool("shared_pool", 2);
-      shared_pool->add(target_op, true, {0, 1});
-      shared_pool->add(load_op1, true, {0, 1});
-      shared_pool->add(load_op2, true, {0, 1});
+      benchmark_op_->add_arg(periodic_condition);
     }
 
-    // Connect operators
-    add_flow(target_op, sink_op, {{"frame", "data"}});
-    add_flow(load_op1, sink_op, {{"load_data", "data"}});
-    add_flow(load_op2, sink_op, {{"load_data", "data"}});
+    auto dummy_load_op_1 = make_operator<DummyLoadOp>("dummy_load_op_1", background_workload_size_);
+    auto dummy_load_op_2 = make_operator<DummyLoadOp>("dummy_load_op_2", background_workload_size_);
+    add_operator(dummy_load_op_1);
+    add_operator(dummy_load_op_2);
+
   }
 
-  ops::TargetOperator::Statistics get_benchmark_results() {
-    return target_operator_->get_statistics();
+  BenchmarkStats get_execution_time_benchmark_stats() {
+    return benchmark_op_->get_execution_time_benchmark_stats();
+  }
+
+  BenchmarkStats get_period_benchmark_stats() {
+    return benchmark_op_->get_period_benchmark_stats();
   }
 
  private:
   int target_fps_;
-  int duration_seconds_;
   bool use_realtime_;
   SchedulingPolicy scheduling_policy_;
-  double load_duration_ms_;
-  std::shared_ptr<ops::TargetOperator> target_operator_;
+  int background_load_intensity_;
+  int background_workload_size_;
+  std::shared_ptr<BenchmarkOp> benchmark_op_;
 };
 
-struct BenchmarkResults {
-  int target_fps;
-  int frame_count;
-  double total_duration_s;
-  double actual_duration_s;
-  bool use_realtime;
-  std::string scheduling_policy;
-  double load_duration_ms;
-  
-  struct {
-    double mean_ms;
-    double std_ms;
-    double min_ms;
-    double max_ms;
-  } frame_period_stats;
-  
-  struct {
-    double mean_ms;
-    double std_ms;
-    double min_ms;
-    double max_ms;
-  } execution_time_stats;
-  
-  std::vector<double> frame_periods_ms;
-  std::vector<double> execution_times_ms;
-};
+void print_title(const std::string& title) {
+  std::cout << std::string(80, '=') << std::endl;
+  std::cout << title << std::endl;
+  std::cout << std::string(80, '=') << std::endl;
+}
 
-BenchmarkResults run_benchmark(int target_fps,
-                              int duration_seconds,
-                              bool use_realtime,
-                              SchedulingPolicy scheduling_policy,
-                              double load_duration_ms) {
-  std::cout << "\n" << std::string(60, '=') << std::endl;
-  std::cout << "Running benchmark:" << std::endl;
+void print_benchmark_config(int target_fps, int duration_seconds, const std::string& scheduling_policy_str, 
+                           int background_load_intensity, int background_workload_size, bool use_realtime, int worker_thread_number) {
   std::cout << "  Target FPS: " << target_fps << std::endl;
   std::cout << "  Duration: " << duration_seconds << "s" << std::endl;
   std::cout << "  Realtime: " << (use_realtime ? "true" : "false") << std::endl;
-  std::cout << "  Policy: " << (use_realtime ? 
-      (scheduling_policy == SchedulingPolicy::kDeadline ? "SCHED_DEADLINE" :
-       scheduling_policy == SchedulingPolicy::kFirstInFirstOut ? "SCHED_FIFO" : "SCHED_RR") 
-      : "Normal") << std::endl;
-  std::cout << "  Load Duration: " << load_duration_ms << "ms per operator call" << std::endl;
-  std::cout << "  EBS Worker Threads: 3" << std::endl;
-  std::cout << std::string(60, '=') << std::endl;
-
-  auto app = std::make_shared<RealtimeThreadBenchmark>(
-      target_fps, duration_seconds, use_realtime, scheduling_policy, load_duration_ms);
-
-  // Calculate scheduler timeout with reasonable buffer
-  int64_t startup_buffer_ms = 1000;   // 1s for application startup
-  int64_t shutdown_buffer_ms = 1000;  // 1s for graceful shutdown
-  int64_t overhead_buffer_ms = std::min(std::max(500L, static_cast<int64_t>(duration_seconds * 20)), 5000L);
-
-  int64_t max_duration_ms = duration_seconds * 1000 + startup_buffer_ms + shutdown_buffer_ms + overhead_buffer_ms;
-
-  auto scheduler = app->make_scheduler<EventBasedScheduler>(
-      "benchmark_scheduler",
-      Arg("worker_thread_number", static_cast<int64_t>(3)),
-      Arg("max_duration_ms", max_duration_ms));
-  app->scheduler(scheduler);
-
-  // Run the application
-  auto start_time = std::chrono::steady_clock::now();
-  app->run();
-  auto end_time = std::chrono::steady_clock::now();
-
-  // Get results and raw data
-  auto results = app->get_benchmark_results();
-
-  BenchmarkResults benchmark_results;
-  benchmark_results.target_fps = results.target_fps;
-  benchmark_results.frame_count = results.frame_count;
-  benchmark_results.total_duration_s = results.total_duration_s;
-  benchmark_results.actual_duration_s = std::chrono::duration<double>(end_time - start_time).count();
-  benchmark_results.use_realtime = use_realtime;
-  benchmark_results.scheduling_policy = use_realtime ? 
-      (scheduling_policy == SchedulingPolicy::kDeadline ? "SCHED_DEADLINE" :
-       scheduling_policy == SchedulingPolicy::kFirstInFirstOut ? "SCHED_FIFO" : "SCHED_RR") 
-      : "Normal";
-  benchmark_results.load_duration_ms = load_duration_ms;
-  benchmark_results.frame_period_stats.mean_ms = results.frame_period_stats.mean_ms;
-  benchmark_results.frame_period_stats.std_ms = results.frame_period_stats.std_ms;
-  benchmark_results.frame_period_stats.min_ms = results.frame_period_stats.min_ms;
-  benchmark_results.frame_period_stats.max_ms = results.frame_period_stats.max_ms;
-  benchmark_results.execution_time_stats.mean_ms = results.execution_time_stats.mean_ms;
-  benchmark_results.execution_time_stats.std_ms = results.execution_time_stats.std_ms;
-  benchmark_results.execution_time_stats.min_ms = results.execution_time_stats.min_ms;
-  benchmark_results.execution_time_stats.max_ms = results.execution_time_stats.max_ms;
-  benchmark_results.frame_periods_ms = results.frame_periods_ms;
-  benchmark_results.execution_times_ms = results.execution_times_ms;
-
-  return benchmark_results;
+  if (use_realtime) {
+    std::cout << "  Scheduling Policy: " << scheduling_policy_str << std::endl;
+  }
+  std::cout << "  Background Workload Intensity: " << background_load_intensity << std::endl;
+  std::cout << "  Background Workload Size: " << background_workload_size << std::endl;
+  std::cout << "  Worker Thread Number: " << worker_thread_number << std::endl;
 }
 
-void print_results(const BenchmarkResults& results) {
-  std::cout << "\nBenchmark Results:" << std::endl;
-  std::string rt_status = results.use_realtime ? "RT" : "Normal";
-  std::cout << "  Configuration: " << results.scheduling_policy << " (" << rt_status << ")" << std::endl;
-  std::cout << "  Target FPS: " << results.target_fps << std::endl;
-
-  // KEY METRICS FIRST - Frame timing consistency
-  if (results.frame_period_stats.std_ms > 0) {
-    double target_period_ms = 1000.0 / results.target_fps;
-    std::cout << "  ★ Frame Period Std Dev: " << std::fixed << std::setprecision(3) 
-              << results.frame_period_stats.std_ms << "ms  ← KEY METRIC" << std::endl;
-    std::cout << "  Frame Period Mean: " << std::fixed << std::setprecision(3) 
-              << results.frame_period_stats.mean_ms << "ms (Target: " 
-              << std::fixed << std::setprecision(1) << target_period_ms << "ms)" << std::endl;
+void print_benchmark_results(
+  const BenchmarkStats& period_stats,
+  const BenchmarkStats& execution_time_stats,
+  int target_fps,
+  double total_duration_s,
+  const std::string& context_type) {
+  std::cout << "=== " << context_type << " ===" << std::endl;
+  std::cout << std::fixed << std::setprecision(3) << std::dec;
+  
+  if (period_stats.sample_count > 0) {
+    double target_period_ms = 1000.0 / target_fps;
+    std::cout << "Period Statistics:" << std::endl;
+    std::cout << "  Average: " << period_stats.avg << " ms (Target: " 
+              << std::fixed << std::setprecision(3) << target_period_ms << " ms)" << std::endl;
+    std::cout << "  Std Dev: " << period_stats.std_dev << " ms" << std::endl;
+    std::cout << "  Min:     " << period_stats.min_val << " ms" << std::endl;
+    std::cout << "  P50:     " << period_stats.p50 << " ms" << std::endl;
+    std::cout << "  P95:     " << period_stats.p95 << " ms" << std::endl;
+    std::cout << "  P99:     " << period_stats.p99 << " ms" << std::endl;
+    std::cout << "  Max:     " << period_stats.max_val << " ms" << std::endl;
   }
 
-  // SECONDARY METRICS - Execution consistency
-  if (results.execution_time_stats.std_ms > 0) {
-    std::cout << "  Execution Time Std Dev: " << std::fixed << std::setprecision(3) 
-              << results.execution_time_stats.std_ms << "ms" << std::endl;
-    std::cout << "  Execution Time Mean: " << std::fixed << std::setprecision(3) 
-              << results.execution_time_stats.mean_ms << "ms" << std::endl;
+  if (execution_time_stats.sample_count > 0) {
+    std::cout << "Execution Time Statistics:" << std::endl;
+    std::cout << "  Average: " << execution_time_stats.avg << " ms" << std::endl;
+    std::cout << "  Std Dev: " << execution_time_stats.std_dev << " ms" << std::endl;
+    std::cout << "  Min:     " << execution_time_stats.min_val << " ms" << std::endl;
+    std::cout << "  P50:     " << execution_time_stats.p50 << " ms" << std::endl;
+    std::cout << "  P95:     " << execution_time_stats.p95 << " ms" << std::endl;
+    std::cout << "  P99:     " << execution_time_stats.p99 << " ms" << std::endl;
+    std::cout << "  Max:     " << execution_time_stats.max_val << " ms" << std::endl;
   }
 
-  // DETAILED RANGES - Less critical but informative
-  if (results.frame_period_stats.std_ms > 0 && results.execution_time_stats.std_ms > 0) {
-    std::cout << "  Frame Period Min/Max: " << std::fixed << std::setprecision(1) 
-              << results.frame_period_stats.min_ms << "ms / " 
-              << results.frame_period_stats.max_ms << "ms" << std::endl;
-    std::cout << "  Execution Range: " << std::fixed << std::setprecision(3) 
-              << results.execution_time_stats.min_ms << "ms - " 
-              << results.execution_time_stats.max_ms << "ms" << std::endl;
-  }
-
-  // TEST VALIDATION INFO - Basic metadata last
-  std::cout << "  Frame Count: " << results.frame_count << std::endl;
+  std::cout << "Test Information:" << std::endl;
+  std::cout << "  Sample Count: " << period_stats.sample_count << std::endl;
   std::cout << "  Total Duration: " << std::fixed << std::setprecision(2) 
-            << results.total_duration_s << "s" << std::endl;
-  std::cout << "  Load Duration: " << std::fixed << std::setprecision(1) 
-            << results.load_duration_ms << "ms per call" << std::endl;
-}
-
-void save_results_to_json(const BenchmarkResults& normal_results,
-                         const BenchmarkResults& realtime_results,
-                         const std::string& filename) {
-  std::ofstream file(filename);
-  file << "{\n";
-  
-  // Normal results
-  file << "  \"normal\": {\n";
-  file << "    \"target_fps\": " << normal_results.target_fps << ",\n";
-  file << "    \"frame_count\": " << normal_results.frame_count << ",\n";
-  file << "    \"total_duration_s\": " << std::fixed << std::setprecision(6) << normal_results.total_duration_s << ",\n";
-  file << "    \"actual_duration_s\": " << std::fixed << std::setprecision(6) << normal_results.actual_duration_s << ",\n";
-  file << "    \"use_realtime\": " << (normal_results.use_realtime ? "true" : "false") << ",\n";
-  file << "    \"scheduling_policy\": \"" << normal_results.scheduling_policy << "\",\n";
-  file << "    \"load_duration_ms\": " << std::fixed << std::setprecision(1) << normal_results.load_duration_ms;
-  
-  if (!normal_results.frame_periods_ms.empty()) {
-    file << ",\n    \"frame_period_stats\": {\n";
-    file << "      \"mean_ms\": " << std::fixed << std::setprecision(6) << normal_results.frame_period_stats.mean_ms << ",\n";
-    file << "      \"std_ms\": " << std::fixed << std::setprecision(6) << normal_results.frame_period_stats.std_ms << ",\n";
-    file << "      \"min_ms\": " << std::fixed << std::setprecision(6) << normal_results.frame_period_stats.min_ms << ",\n";
-    file << "      \"max_ms\": " << std::fixed << std::setprecision(6) << normal_results.frame_period_stats.max_ms << "\n";
-    file << "    },\n";
-    file << "    \"frame_periods_ms\": [";
-    for (size_t i = 0; i < normal_results.frame_periods_ms.size(); ++i) {
-      if (i > 0) file << ", ";
-      file << std::fixed << std::setprecision(6) << normal_results.frame_periods_ms[i];
-    }
-    file << "]";
-  }
-  
-  if (!normal_results.execution_times_ms.empty()) {
-    file << ",\n    \"execution_time_stats\": {\n";
-    file << "      \"mean_ms\": " << std::fixed << std::setprecision(6) << normal_results.execution_time_stats.mean_ms << ",\n";
-    file << "      \"std_ms\": " << std::fixed << std::setprecision(6) << normal_results.execution_time_stats.std_ms << ",\n";
-    file << "      \"min_ms\": " << std::fixed << std::setprecision(6) << normal_results.execution_time_stats.min_ms << ",\n";
-    file << "      \"max_ms\": " << std::fixed << std::setprecision(6) << normal_results.execution_time_stats.max_ms << "\n";
-    file << "    },\n";
-    file << "    \"execution_times_ms\": [";
-    for (size_t i = 0; i < normal_results.execution_times_ms.size(); ++i) {
-      if (i > 0) file << ", ";
-      file << std::fixed << std::setprecision(6) << normal_results.execution_times_ms[i];
-    }
-    file << "]";
-  }
-  
-  file << "\n  },\n";
-  
-  // Realtime results
-  file << "  \"realtime\": {\n";
-  file << "    \"target_fps\": " << realtime_results.target_fps << ",\n";
-  file << "    \"frame_count\": " << realtime_results.frame_count << ",\n";
-  file << "    \"total_duration_s\": " << std::fixed << std::setprecision(6) << realtime_results.total_duration_s << ",\n";
-  file << "    \"actual_duration_s\": " << std::fixed << std::setprecision(6) << realtime_results.actual_duration_s << ",\n";
-  file << "    \"use_realtime\": " << (realtime_results.use_realtime ? "true" : "false") << ",\n";
-  file << "    \"scheduling_policy\": \"" << realtime_results.scheduling_policy << "\",\n";
-  file << "    \"load_duration_ms\": " << std::fixed << std::setprecision(1) << realtime_results.load_duration_ms;
-  
-  if (!realtime_results.frame_periods_ms.empty()) {
-    file << ",\n    \"frame_period_stats\": {\n";
-    file << "      \"mean_ms\": " << std::fixed << std::setprecision(6) << realtime_results.frame_period_stats.mean_ms << ",\n";
-    file << "      \"std_ms\": " << std::fixed << std::setprecision(6) << realtime_results.frame_period_stats.std_ms << ",\n";
-    file << "      \"min_ms\": " << std::fixed << std::setprecision(6) << realtime_results.frame_period_stats.min_ms << ",\n";
-    file << "      \"max_ms\": " << std::fixed << std::setprecision(6) << realtime_results.frame_period_stats.max_ms << "\n";
-    file << "    },\n";
-    file << "    \"frame_periods_ms\": [";
-    for (size_t i = 0; i < realtime_results.frame_periods_ms.size(); ++i) {
-      if (i > 0) file << ", ";
-      file << std::fixed << std::setprecision(6) << realtime_results.frame_periods_ms[i];
-    }
-    file << "]";
-  }
-  
-  if (!realtime_results.execution_times_ms.empty()) {
-    file << ",\n    \"execution_time_stats\": {\n";
-    file << "      \"mean_ms\": " << std::fixed << std::setprecision(6) << realtime_results.execution_time_stats.mean_ms << ",\n";
-    file << "      \"std_ms\": " << std::fixed << std::setprecision(6) << realtime_results.execution_time_stats.std_ms << ",\n";
-    file << "      \"min_ms\": " << std::fixed << std::setprecision(6) << realtime_results.execution_time_stats.min_ms << ",\n";
-    file << "      \"max_ms\": " << std::fixed << std::setprecision(6) << realtime_results.execution_time_stats.max_ms << "\n";
-    file << "    },\n";
-    file << "    \"execution_times_ms\": [";
-    for (size_t i = 0; i < realtime_results.execution_times_ms.size(); ++i) {
-      if (i > 0) file << ", ";
-      file << std::fixed << std::setprecision(6) << realtime_results.execution_times_ms[i];
-    }
-    file << "]";
-  }
-  
-  file << "\n  }\n";
-  file << "}\n";
-  
-  std::cout << "\nResults saved to: " << filename << std::endl;
+            << total_duration_s << "s" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
   // Default parameters
   int target_fps = 60;
-  int duration_seconds = 30;
+  int duration_seconds = 10;
   std::string scheduling_policy_str = "SCHED_DEADLINE";
-  double load_duration_ms = 20.0;
-  std::string output_file = "benchmark_results.json";
+  int background_load_intensity = 1000;
+  int background_workload_size = 100;
+  int worker_thread_number = 2;
 
   // Parse command line arguments
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--target-fps" && i + 1 < argc) {
-      target_fps = std::stoi(argv[++i]);
+      target_fps = std::atoi(argv[++i]);
     } else if (arg == "--duration" && i + 1 < argc) {
-      duration_seconds = std::stoi(argv[++i]);
+      duration_seconds = std::atoi(argv[++i]);
     } else if (arg == "--scheduling-policy" && i + 1 < argc) {
       scheduling_policy_str = argv[++i];
-    } else if (arg == "--load-duration-ms" && i + 1 < argc) {
-      load_duration_ms = std::stod(argv[++i]);
-    } else if (arg == "--output" && i + 1 < argc) {
-      output_file = argv[++i];
+    } else if (arg == "--load-intensity" && i + 1 < argc) {
+      background_load_intensity = std::atoi(argv[++i]);
+      if (background_load_intensity <= 0) {
+        std::cerr << "Error: load-intensity must be positive\n";
+        return 1;
+      }
+    } else if (arg == "--workload-size" && i + 1 < argc) {
+      background_workload_size = std::atoi(argv[++i]);
+      if (background_workload_size <= 0) {
+        std::cerr << "Error: workload-size must be positive\n";
+        return 1;
+      }
+    } else if (arg == "--worker-thread-number" && i + 1 < argc) {
+      worker_thread_number = std::atoi(argv[++i]);
+      if (worker_thread_number <= 1) {
+        std::cerr << "Error: worker-thread-number must be greater than 1\n";
+        return 1;
+      }
     } else if (arg == "--help") {
       std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
       std::cout << "Options:" << std::endl;
       std::cout << "  --target-fps <fps>           Target FPS (30 or 60, default: 60)" << std::endl;
       std::cout << "  --duration <seconds>        Benchmark duration in seconds (default: 30)" << std::endl;
       std::cout << "  --scheduling-policy <policy> SCHED_DEADLINE, SCHED_FIFO, or SCHED_RR (default: SCHED_DEADLINE)" << std::endl;
-      std::cout << "  --load-duration-ms <ms>     CPU work duration per load operator call (default: 20.0)" << std::endl;
-      std::cout << "  --output <file>             Output JSON file (default: benchmark_results.json)" << std::endl;
+      std::cout << "  --load-intensity <intensity> Background workload intensity (default: 1000)" << std::endl;
+      std::cout << "  --workload-size <size>     Background workload size (default: 1000)" << std::endl;
+      std::cout << "  --worker-thread-number <number> Worker thread number (default: 2)" << std::endl;
       std::cout << "  --help                      Show this help message" << std::endl;
       return 0;
     }
@@ -378,44 +409,74 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::cout << "Running real-time thread scheduling comparison..." << std::endl;
+  print_title("Real-time Thread Benchmark");
+  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number);
 
   // Run without real-time scheduling
-  auto normal_results = run_benchmark(target_fps, duration_seconds, false, scheduling_policy, load_duration_ms);
+  print_title("Running benchmark for baseline\n(without real-time thread)");
+  auto non_rt_app = std::make_unique<RealtimeThreadBenchmarkApp>(
+    target_fps, false, scheduling_policy, background_load_intensity, background_workload_size);
+  non_rt_app->scheduler(non_rt_app->make_scheduler<EventBasedScheduler>(
+    "event-based",
+    Arg("worker_thread_number", static_cast<int64_t>(worker_thread_number)),
+    Arg("max_duration_ms", static_cast<int64_t>(duration_seconds * 1000))));
+  non_rt_app->run();
+  auto non_rt_period_stats = non_rt_app->get_period_benchmark_stats();
+  auto non_rt_execution_time_stats = non_rt_app->get_execution_time_benchmark_stats();
+  // auto normal_results = run_benchmark(target_fps, duration_seconds, false, scheduling_policy, background_load_intensity, background_workload_size);
 
   // Run with real-time scheduling
-  auto realtime_results = run_benchmark(target_fps, duration_seconds, true, scheduling_policy, load_duration_ms);
+  print_title("Running benchmark for real-time\n(with real-time scheduling)");
+  auto rt_app = std::make_unique<RealtimeThreadBenchmarkApp>(
+    target_fps, true, scheduling_policy, background_load_intensity, background_workload_size);
+  rt_app->scheduler(rt_app->make_scheduler<EventBasedScheduler>(
+    "event-based",
+    Arg("worker_thread_number", static_cast<int64_t>(worker_thread_number)),
+    Arg("max_duration_ms", static_cast<int64_t>(duration_seconds * 1000))));
+  rt_app->run();
+  auto rt_period_stats = rt_app->get_period_benchmark_stats();
+  auto rt_execution_time_stats = rt_app->get_execution_time_benchmark_stats();
+  // auto realtime_results = run_benchmark(target_fps, duration_seconds, true, scheduling_policy, background_load_intensity, background_workload_size);
 
-  // Save results to JSON file
-  save_results_to_json(normal_results, realtime_results, output_file);
+  // Display benchmark configurations
+  print_title("Benchmark Configurations");
+  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number);
+  std::cout << std::endl;
 
-  print_results(normal_results);
-  print_results(realtime_results);
+  // Display benchmark results
+  print_title("Benchmark Results");
+  print_benchmark_results(non_rt_period_stats, non_rt_execution_time_stats, target_fps, duration_seconds, "Non-real-time Thread (Baseline)");
+  std::cout << std::endl;
+  print_benchmark_results(rt_period_stats, rt_execution_time_stats, target_fps, duration_seconds, "Real-time Thread");
+  std::cout << std::endl;
 
-  std::cout << "\n" << std::string(65, '=') << std::endl;
-  std::cout << "COMPARISON SUMMARY" << std::endl;
-  std::cout << std::string(65, '=') << std::endl;
-  std::cout << "                        Normal    Real-time    Improvement" << std::endl;
-  std::cout << std::string(65, '-') << std::endl;
+  // Performance Comparison
+  print_title("Non-real-time and Real-time Thread Benchmark Comparison");
 
-  if (normal_results.frame_period_stats.std_ms > 0 && realtime_results.frame_period_stats.std_ms > 0) {
-    double normal_period_std = normal_results.frame_period_stats.std_ms;
-    double realtime_period_std = realtime_results.frame_period_stats.std_ms;
-    double period_std_improvement = (realtime_period_std / normal_period_std - 1) * 100;
-    std::cout << "★ Frame Period Std Dev: " << std::fixed << std::setprecision(3) << normal_period_std
-              << "    " << std::fixed << std::setprecision(3) << realtime_period_std
-              << "    " << std::fixed << std::setprecision(1) << period_std_improvement << "% ★" << std::endl;
+  std::cout << std::fixed << std::setprecision(3) << std::dec;
+  std::cout << "                        Non-real-time    Real-time    Improvement" << std::endl;
+  std::cout << std::string(80, '-') << std::endl;
+
+  if (non_rt_period_stats.sample_count > 0 && rt_period_stats.sample_count > 0) {
+    double non_rt_period_std = non_rt_period_stats.std_dev;
+    double rt_period_std = rt_period_stats.std_dev;
+    double period_std_improvement = (rt_period_std / non_rt_period_std - 1) * 100;
+    std::cout << "★ Period Std Dev: " << std::setw(8) << non_rt_period_std
+              << "    " << std::setw(8) << rt_period_std
+              << "    " << std::setw(8) << std::showpos << period_std_improvement << "% ★" << std::endl;
   }
 
   // Secondary metrics
-  if (normal_results.execution_time_stats.std_ms > 0 && realtime_results.execution_time_stats.std_ms > 0) {
-    double normal_exec_std = normal_results.execution_time_stats.std_ms;
-    double realtime_exec_std = realtime_results.execution_time_stats.std_ms;
-    double exec_std_improvement = (realtime_exec_std / normal_exec_std - 1) * 100;
-    std::cout << "  Exec Time Std Dev:     " << std::fixed << std::setprecision(3) << normal_exec_std
-              << "    " << std::fixed << std::setprecision(3) << realtime_exec_std
-              << "    " << std::fixed << std::setprecision(1) << exec_std_improvement << "%" << std::endl;
+  if (non_rt_execution_time_stats.sample_count > 0 && rt_execution_time_stats.sample_count > 0) {
+    double non_rt_exec_std = non_rt_execution_time_stats.std_dev;
+    double rt_exec_std = rt_execution_time_stats.std_dev;
+    double exec_std_improvement = (rt_exec_std / non_rt_exec_std - 1) * 100;
+    std::cout << "  Exec Time Std Dev:     " << std::setw(8) << non_rt_exec_std
+              << "    " << std::setw(8) << rt_exec_std
+              << "    " << std::setw(8) << exec_std_improvement << "%" << std::endl;
   }
+
+  std::cout << std::noshowpos;
 
   return 0;
 }

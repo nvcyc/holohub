@@ -24,9 +24,6 @@
 namespace holoscan {
 namespace ops {
 
-void TargetOperator::setup(OperatorSpec& spec) {
-  spec.output<int>("frame");
-}
 
 void TargetOperator::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
   auto current_time = std::chrono::steady_clock::now();
@@ -57,9 +54,6 @@ void TargetOperator::compute(InputContext& op_input, OutputContext& op_output, E
         execution_end - current_time).count();
     execution_times_.push_back(execution_time_ns);
   }
-
-  // Emit frame number
-  op_output.emit(frame_count_, "frame");
 }
 
 TargetOperator::Statistics TargetOperator::get_statistics() const {

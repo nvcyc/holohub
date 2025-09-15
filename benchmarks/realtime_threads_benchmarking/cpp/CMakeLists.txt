@@ -14,7 +14,7 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.20)
-project(model_benchmarking CXX)
+project(realtime_thread_benchmarking CXX)
 
 find_package(holoscan 3.5 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
@@ -22,12 +22,6 @@ find_package(holoscan 3.5 REQUIRED CONFIG
 # Create the benchmark executable
 add_executable(realtime_thread_benchmark
   realtime_thread_benchmark.cpp
-  target_operator.hpp
-  target_operator.cpp
-  load_operator.hpp
-  load_operator.cpp
-  data_sink_operator.hpp
-  data_sink_operator.cpp
 )
 
 # Link against Holoscan

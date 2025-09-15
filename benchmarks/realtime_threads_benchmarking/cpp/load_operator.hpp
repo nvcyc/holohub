@@ -31,7 +31,6 @@ class LoadOperator : public Operator {
 
   LoadOperator(double load_duration_ms = 10.0) : load_duration_ms_(load_duration_ms), iterations_(0) {}
 
-  void setup(OperatorSpec& spec) override;
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
 
  private:
