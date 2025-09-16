@@ -174,9 +174,6 @@ class BenchmarkOp : public Operator {
     auto execution_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         end_time - start_time).count();
     execution_times_ns_.push_back(execution_time_ns);
-
-    HOLOSCAN_LOG_INFO("[BenchmarkOp] ticking.");
-
   };
 
   BenchmarkStats get_execution_time_benchmark_stats() const {
@@ -311,7 +308,6 @@ void print_benchmark_results(
   const BenchmarkStats& period_stats,
   const BenchmarkStats& execution_time_stats,
   int target_fps,
-  double total_duration_s,
   const std::string& context_type) {
   std::cout << "=== " << context_type << " ===" << std::endl;
   std::cout << std::fixed << std::setprecision(3) << std::dec;
@@ -327,23 +323,8 @@ void print_benchmark_results(
     std::cout << "  P95:     " << period_stats.p95 << " ms" << std::endl;
     std::cout << "  P99:     " << period_stats.p99 << " ms" << std::endl;
     std::cout << "  Max:     " << period_stats.max_val << " ms" << std::endl;
+    std::cout << "  Samples: " << period_stats.sample_count << std::endl << std::endl;
   }
-
-  if (execution_time_stats.sample_count > 0) {
-    std::cout << "Execution Time Statistics:" << std::endl;
-    std::cout << "  Average: " << execution_time_stats.avg << " ms" << std::endl;
-    std::cout << "  Std Dev: " << execution_time_stats.std_dev << " ms" << std::endl;
-    std::cout << "  Min:     " << execution_time_stats.min_val << " ms" << std::endl;
-    std::cout << "  P50:     " << execution_time_stats.p50 << " ms" << std::endl;
-    std::cout << "  P95:     " << execution_time_stats.p95 << " ms" << std::endl;
-    std::cout << "  P99:     " << execution_time_stats.p99 << " ms" << std::endl;
-    std::cout << "  Max:     " << execution_time_stats.max_val << " ms" << std::endl;
-  }
-
-  std::cout << "Test Information:" << std::endl;
-  std::cout << "  Sample Count: " << period_stats.sample_count << std::endl;
-  std::cout << "  Total Duration: " << std::fixed << std::setprecision(2) 
-            << total_duration_s << "s" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -445,36 +426,29 @@ int main(int argc, char* argv[]) {
 
   // Display benchmark results
   print_title("Benchmark Results");
-  print_benchmark_results(non_rt_period_stats, non_rt_execution_time_stats, target_fps, duration_seconds, "Non-real-time Thread (Baseline)");
-  std::cout << std::endl;
-  print_benchmark_results(rt_period_stats, rt_execution_time_stats, target_fps, duration_seconds, "Real-time Thread");
-  std::cout << std::endl;
+  print_benchmark_results(non_rt_period_stats, non_rt_execution_time_stats, target_fps, "Non-real-time Thread (Baseline)");
+  print_benchmark_results(rt_period_stats, rt_execution_time_stats, target_fps, "Real-time Thread");
 
   // Performance Comparison
   print_title("Non-real-time and Real-time Thread Benchmark Comparison");
 
-  std::cout << std::fixed << std::setprecision(3) << std::dec;
-  std::cout << "                        Non-real-time    Real-time    Improvement" << std::endl;
-  std::cout << std::string(80, '-') << std::endl;
+  // Calculate improvements in period metrics
+  double avg_improvement = ((non_rt_period_stats.avg - rt_period_stats.avg) / non_rt_period_stats.avg) * 100.0;
+  double p95_improvement = ((non_rt_period_stats.p95 - rt_period_stats.p95) / non_rt_period_stats.p95) * 100.0;
+  double p99_improvement = ((non_rt_period_stats.p99 - rt_period_stats.p99) / non_rt_period_stats.p99) * 100.0;
 
-  if (non_rt_period_stats.sample_count > 0 && rt_period_stats.sample_count > 0) {
-    double non_rt_period_std = non_rt_period_stats.std_dev;
-    double rt_period_std = rt_period_stats.std_dev;
-    double period_std_improvement = (rt_period_std / non_rt_period_std - 1) * 100;
-    std::cout << "★ Period Std Dev: " << std::setw(8) << non_rt_period_std
-              << "    " << std::setw(8) << rt_period_std
-              << "    " << std::setw(8) << std::showpos << period_std_improvement << "% ★" << std::endl;
-  }
+  std::cout << std::fixed << std::setprecision(2) << std::dec;
 
-  // Secondary metrics
-  if (non_rt_execution_time_stats.sample_count > 0 && rt_execution_time_stats.sample_count > 0) {
-    double non_rt_exec_std = non_rt_execution_time_stats.std_dev;
-    double rt_exec_std = rt_execution_time_stats.std_dev;
-    double exec_std_improvement = (rt_exec_std / non_rt_exec_std - 1) * 100;
-    std::cout << "  Exec Time Std Dev:     " << std::setw(8) << non_rt_exec_std
-              << "    " << std::setw(8) << rt_exec_std
-              << "    " << std::setw(8) << exec_std_improvement << "%" << std::endl;
-  }
+  std::cout << "Period:" << std::endl;
+  std::cout << "  Average Period:  " << std::setw(8) << non_rt_period_stats.avg << " ms → "
+            << std::setw(8) << rt_period_stats.avg << " ms  (" << std::showpos << avg_improvement << "%)"
+            << std::endl;
+  std::cout << "  95th Percentile:  " << std::setw(8) << non_rt_period_stats.p95 << " ms → "
+            << std::setw(8) << rt_period_stats.p95 << " ms  (" << std::showpos << p95_improvement << "%)"
+            << std::endl;
+  std::cout << "  99th Percentile:  " << std::setw(8) << non_rt_period_stats.p99 << " ms → "
+            << std::setw(8) << rt_period_stats.p99 << " ms  (" << std::showpos << p99_improvement << "%)"
+            << std::endl << std::endl;
 
   std::cout << std::noshowpos;
 
