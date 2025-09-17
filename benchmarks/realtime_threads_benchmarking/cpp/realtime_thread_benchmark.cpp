@@ -228,12 +228,14 @@ class RealtimeThreadBenchmarkApp : public Application {
                          bool use_realtime = false,
                          SchedulingPolicy scheduling_policy = SchedulingPolicy::kDeadline,
                          int background_load_intensity = 1000,
-                         int background_workload_size = 1000)
+                         int background_workload_size = 1000,
+                         int dummy_load_number = 2)
       : target_fps_(target_fps),
         use_realtime_(use_realtime),
         scheduling_policy_(scheduling_policy),
         background_load_intensity_(background_load_intensity),
-        background_workload_size_(background_workload_size) {}
+        background_workload_size_(background_workload_size),
+        dummy_load_number_(dummy_load_number) {}
 
   void compose() override {
     benchmark_op_ = make_operator<BenchmarkOp>("benchmark_op", target_fps_);
@@ -261,10 +263,11 @@ class RealtimeThreadBenchmarkApp : public Application {
       benchmark_op_->add_arg(periodic_condition);
     }
 
-    auto dummy_load_op_1 = make_operator<DummyLoadOp>("dummy_load_op_1", background_workload_size_);
-    auto dummy_load_op_2 = make_operator<DummyLoadOp>("dummy_load_op_2", background_workload_size_);
-    add_operator(dummy_load_op_1);
-    add_operator(dummy_load_op_2);
+    // Create dummy load operators based on dummy_load_number_
+    for (int i = 0; i < dummy_load_number_; ++i) {
+      auto dummy_load_op = make_operator<DummyLoadOp>(("dummy_load_op_" + std::to_string(i + 1)), background_workload_size_);
+      add_operator(dummy_load_op);
+    }
 
   }
 
@@ -282,6 +285,7 @@ class RealtimeThreadBenchmarkApp : public Application {
   SchedulingPolicy scheduling_policy_;
   int background_load_intensity_;
   int background_workload_size_;
+  int dummy_load_number_;
   std::shared_ptr<BenchmarkOp> benchmark_op_;
 };
 
@@ -292,7 +296,7 @@ void print_title(const std::string& title) {
 }
 
 void print_benchmark_config(int target_fps, int duration_seconds, const std::string& scheduling_policy_str, 
-                           int background_load_intensity, int background_workload_size, bool use_realtime, int worker_thread_number) {
+                           int background_load_intensity, int background_workload_size, bool use_realtime, int worker_thread_number, int dummy_load_number) {
   std::cout << "  Target FPS: " << target_fps << std::endl;
   std::cout << "  Duration: " << duration_seconds << "s" << std::endl;
   std::cout << "  Realtime: " << (use_realtime ? "true" : "false") << std::endl;
@@ -302,6 +306,7 @@ void print_benchmark_config(int target_fps, int duration_seconds, const std::str
   std::cout << "  Background Workload Intensity: " << background_load_intensity << std::endl;
   std::cout << "  Background Workload Size: " << background_workload_size << std::endl;
   std::cout << "  Worker Thread Number: " << worker_thread_number << std::endl;
+  std::cout << "  Dummy Load Number: " << dummy_load_number << std::endl;
 }
 
 void print_benchmark_results(
@@ -327,6 +332,121 @@ void print_benchmark_results(
   }
 }
 
+void write_json_results(const std::string& filename, 
+  const BenchmarkStats& non_rt_period_stats,
+  const BenchmarkStats& rt_period_stats,
+  const BenchmarkStats& non_rt_execution_stats,
+  const BenchmarkStats& rt_execution_stats,
+  int target_fps,
+  int duration_seconds,
+  const std::string& scheduling_policy_str,
+  int background_load_intensity,
+  int background_workload_size,
+  int worker_thread_number,
+  int dummy_load_number) {
+std::ofstream file(filename);
+if (!file.is_open()) {
+std::cerr << "Error: Could not open file " << filename << " for writing" << std::endl;
+return;
+}
+
+file << std::fixed << std::setprecision(6);
+file << "{\n";
+file << "  \"benchmark_config\": {\n";
+file << "    \"target_fps\": " << target_fps << ",\n";
+file << "    \"duration_seconds\": " << duration_seconds << ",\n";
+file << "    \"scheduling_policy\": \"" << scheduling_policy_str << "\",\n";
+file << "    \"background_load_intensity\": " << background_load_intensity << ",\n";
+file << "    \"background_workload_size\": " << background_workload_size << ",\n";
+file << "    \"worker_thread_number\": " << worker_thread_number << ",\n";
+file << "    \"dummy_load_number\": " << dummy_load_number << "\n";
+file << "  },\n";
+
+file << "  \"period_statistics\": {\n";
+file << "    \"non_realtime\": {\n";
+file << "      \"raw_data\": [";
+for (size_t i = 0; i < non_rt_period_stats.sorted_data.size(); ++i) {
+if (i > 0) file << ", ";
+file << non_rt_period_stats.sorted_data[i];
+}
+file << "],\n";
+file << "      \"statistics\": {\n";
+file << "        \"sample_count\": " << non_rt_period_stats.sample_count << ",\n";
+file << "        \"average\": " << non_rt_period_stats.avg << ",\n";
+file << "        \"std_dev\": " << non_rt_period_stats.std_dev << ",\n";
+file << "        \"min\": " << non_rt_period_stats.min_val << ",\n";
+file << "        \"p50\": " << non_rt_period_stats.p50 << ",\n";
+file << "        \"p95\": " << non_rt_period_stats.p95 << ",\n";
+file << "        \"p99\": " << non_rt_period_stats.p99 << ",\n";
+file << "        \"max\": " << non_rt_period_stats.max_val << "\n";
+file << "      }\n";
+file << "    },\n";
+
+file << "    \"realtime\": {\n";
+file << "      \"raw_data\": [";
+for (size_t i = 0; i < rt_period_stats.sorted_data.size(); ++i) {
+if (i > 0) file << ", ";
+file << rt_period_stats.sorted_data[i];
+}
+file << "],\n";
+file << "      \"statistics\": {\n";
+file << "        \"sample_count\": " << rt_period_stats.sample_count << ",\n";
+file << "        \"average\": " << rt_period_stats.avg << ",\n";
+file << "        \"std_dev\": " << rt_period_stats.std_dev << ",\n";
+file << "        \"min\": " << rt_period_stats.min_val << ",\n";
+file << "        \"p50\": " << rt_period_stats.p50 << ",\n";
+file << "        \"p95\": " << rt_period_stats.p95 << ",\n";
+file << "        \"p99\": " << rt_period_stats.p99 << ",\n";
+file << "        \"max\": " << rt_period_stats.max_val << "\n";
+file << "      }\n";
+file << "    }\n";
+file << "  },\n";
+
+file << "  \"execution_time_statistics\": {\n";
+file << "    \"non_realtime\": {\n";
+file << "      \"raw_data\": [";
+for (size_t i = 0; i < non_rt_execution_stats.sorted_data.size(); ++i) {
+if (i > 0) file << ", ";
+file << non_rt_execution_stats.sorted_data[i];
+}
+file << "],\n";
+file << "      \"statistics\": {\n";
+file << "        \"sample_count\": " << non_rt_execution_stats.sample_count << ",\n";
+file << "        \"average\": " << non_rt_execution_stats.avg << ",\n";
+file << "        \"std_dev\": " << non_rt_execution_stats.std_dev << ",\n";
+file << "        \"min\": " << non_rt_execution_stats.min_val << ",\n";
+file << "        \"p50\": " << non_rt_execution_stats.p50 << ",\n";
+file << "        \"p95\": " << non_rt_execution_stats.p95 << ",\n";
+file << "        \"p99\": " << non_rt_execution_stats.p99 << ",\n";
+file << "        \"max\": " << non_rt_execution_stats.max_val << "\n";
+file << "      }\n";
+file << "    },\n";
+
+file << "    \"realtime\": {\n";
+file << "      \"raw_data\": [";
+for (size_t i = 0; i < rt_execution_stats.sorted_data.size(); ++i) {
+if (i > 0) file << ", ";
+file << rt_execution_stats.sorted_data[i];
+}
+file << "],\n";
+file << "      \"statistics\": {\n";
+file << "        \"sample_count\": " << rt_execution_stats.sample_count << ",\n";
+file << "        \"average\": " << rt_execution_stats.avg << ",\n";
+file << "        \"std_dev\": " << rt_execution_stats.std_dev << ",\n";
+file << "        \"min\": " << rt_execution_stats.min_val << ",\n";
+file << "        \"p50\": " << rt_execution_stats.p50 << ",\n";
+file << "        \"p95\": " << rt_execution_stats.p95 << ",\n";
+file << "        \"p99\": " << rt_execution_stats.p99 << ",\n";
+file << "        \"max\": " << rt_execution_stats.max_val << "\n";
+file << "      }\n";
+file << "    }\n";
+file << "  }\n";
+file << "}\n";
+
+file.close();
+std::cout << "Raw measurement data written to: " << filename << std::endl;
+}
+
 int main(int argc, char* argv[]) {
   // Default parameters
   int target_fps = 60;
@@ -335,7 +455,8 @@ int main(int argc, char* argv[]) {
   int background_load_intensity = 1000;
   int background_workload_size = 100;
   int worker_thread_number = 2;
-
+  int dummy_load_number = 2;
+  std::string output_file = "/tmp/benchmark_plots/realtime_thread_benchmark_results.json";
   // Parse command line arguments
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -363,6 +484,14 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: worker-thread-number must be greater than 1\n";
         return 1;
       }
+    } else if (arg == "--dummy-load-number" && i + 1 < argc) {
+      dummy_load_number = std::atoi(argv[++i]);
+      if (dummy_load_number <= 0) {
+        std::cerr << "Error: dummy-load-number must be positive\n";
+        return 1;
+      }
+    } else if (arg == "--output" && i + 1 < argc) {
+      output_file = argv[++i];
     } else if (arg == "--help") {
       std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
       std::cout << "Options:" << std::endl;
@@ -372,6 +501,8 @@ int main(int argc, char* argv[]) {
       std::cout << "  --load-intensity <intensity> Background workload intensity (default: 1000)" << std::endl;
       std::cout << "  --workload-size <size>     Background workload size (default: 1000)" << std::endl;
       std::cout << "  --worker-thread-number <number> Worker thread number (default: 2)" << std::endl;
+      std::cout << "  --dummy-load-number <number> Number of dummy load operators (default: 2)" << std::endl;
+      std::cout << "  --output <file>            Output JSON file for raw data (default: /tmp/benchmark_plots/realtime_thread_benchmark_results.json)" << std::endl;
       std::cout << "  --help                      Show this help message" << std::endl;
       return 0;
     }
@@ -391,12 +522,12 @@ int main(int argc, char* argv[]) {
   }
 
   print_title("Real-time Thread Benchmark");
-  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number);
+  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number, dummy_load_number);
 
   // Run without real-time scheduling
   print_title("Running benchmark for baseline\n(without real-time thread)");
   auto non_rt_app = std::make_unique<RealtimeThreadBenchmarkApp>(
-    target_fps, false, scheduling_policy, background_load_intensity, background_workload_size);
+    target_fps, false, scheduling_policy, background_load_intensity, background_workload_size, dummy_load_number);
   non_rt_app->scheduler(non_rt_app->make_scheduler<EventBasedScheduler>(
     "event-based",
     Arg("worker_thread_number", static_cast<int64_t>(worker_thread_number)),
@@ -409,7 +540,7 @@ int main(int argc, char* argv[]) {
   // Run with real-time scheduling
   print_title("Running benchmark for real-time\n(with real-time scheduling)");
   auto rt_app = std::make_unique<RealtimeThreadBenchmarkApp>(
-    target_fps, true, scheduling_policy, background_load_intensity, background_workload_size);
+    target_fps, true, scheduling_policy, background_load_intensity, background_workload_size, dummy_load_number);
   rt_app->scheduler(rt_app->make_scheduler<EventBasedScheduler>(
     "event-based",
     Arg("worker_thread_number", static_cast<int64_t>(worker_thread_number)),
@@ -421,7 +552,7 @@ int main(int argc, char* argv[]) {
 
   // Display benchmark configurations
   print_title("Benchmark Configurations");
-  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number);
+  print_benchmark_config(target_fps, duration_seconds, scheduling_policy_str, background_load_intensity, background_workload_size, false, worker_thread_number, dummy_load_number);
   std::cout << std::endl;
 
   // Display benchmark results
@@ -451,6 +582,20 @@ int main(int argc, char* argv[]) {
             << std::endl << std::endl;
 
   std::cout << std::noshowpos;
+
+  // Write raw data to JSON file
+  write_json_results(output_file,
+    non_rt_period_stats,
+    rt_period_stats,
+    non_rt_execution_time_stats,
+    rt_execution_time_stats,
+    target_fps,
+    duration_seconds,
+    scheduling_policy_str,
+    background_load_intensity,
+    background_workload_size,
+    worker_thread_number,
+    dummy_load_number);
 
   return 0;
 }
